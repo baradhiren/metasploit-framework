@@ -1,6 +1,5 @@
 # -*- coding: binary -*-
 require 'rex/text/color'
-require 'rex/ui'
 
 module Rex
 module Ui
@@ -290,8 +289,9 @@ module Shell
   attr_accessor :on_command_proc
   attr_accessor :on_print_proc
   attr_accessor :framework
+  attr_accessor :hist_last_saved # the number of history lines when last saved/loaded
 
-protected
+  protected
 
   def supports_color?
     true
@@ -413,9 +413,12 @@ protected
 
       skip_next = true
       if spec == 'T'
-        # This %T is the strftime shorthand for %H:%M:%S
-        strftime_format = framework.datastore['PromptTimeFormat'] || '%T'
-        formatted << Time.now.strftime(strftime_format).to_s
+        if framework.datastore['PromptTimeFormat']
+          strftime_format = framework.datastore['PromptTimeFormat']
+        else
+          strftime_format = ::Time::DATE_FORMATS[:db].to_s
+        end
+        formatted << ::Time.now.strftime(strftime_format).to_s
       elsif spec == 'W' && framework.db.active
         formatted << framework.db.workspace.name
       elsif session
@@ -481,7 +484,6 @@ protected
   attr_accessor :stop_flag, :cont_prompt # :nodoc:
   attr_accessor :tab_complete_proc # :nodoc:
   attr_accessor :histfile # :nodoc:
-  attr_accessor :hist_last_saved # the number of history lines when last saved/loaded
   attr_accessor :log_source, :stop_count # :nodoc:
   attr_accessor :local_hostname, :local_username # :nodoc:
   attr_reader   :cont_flag # :nodoc:
@@ -491,16 +493,6 @@ private
   attr_writer   :cont_flag # :nodoc:
 
 end
-
-###
-#
-# Pseudo-shell interface that simply includes the Shell mixin.
-#
-###
-class PseudoShell
-  include Shell
-end
-
 
 end end end
 

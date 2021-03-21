@@ -2,9 +2,6 @@
 
 require 'json'
 require 'rexml/document'
-require 'rex/parser/nmap_xml'
-require 'msf/core/db_export'
-require 'msf/ui/console/command_dispatcher/db/analyze'
 require 'metasploit/framework/data_service'
 require 'metasploit/framework/data_service/remote/http/core'
 
@@ -312,27 +309,20 @@ class Db
 
     rws.each do |rw|
       rw.each do |ip|
-        opts[:ip] = ip
-        framework.db.add_host_tag(opts)
+        opts[:address] = ip
+        unless framework.db.add_host_tag(opts)
+          print_error("Host #{ip} could not be found.")
+        end
       end
     end
   end
 
-  def find_hosts_with_tag(workspace_id, host_address, tag_name)
+  def find_host_tags(workspace, host_id)
     opts = Hash.new()
-    opts[:workspace_id] = workspace_id
-    opts[:host_address] = host_address
-    opts[:tag_name] = tag_name
+    opts[:workspace] = workspace
+    opts[:id] = host_id
 
-    framework.db.find_hosts_with_tag(opts)
-  end
-
-  def find_host_tags(workspace_id, host_address)
-    opts = Hash.new()
-    opts[:workspace_id] = workspace_id
-    opts[:host_address] = host_address
-
-    framework.db.find_host_tags(opts)
+    framework.db.get_host_tags(opts)
   end
 
   def delete_host_tag(rws, tag_name)
@@ -341,12 +331,16 @@ class Db
     opts[:tag_name] = tag_name
 
     if rws == [nil]
-      framework.db.delete_host_tag(opts)
+      unless framework.db.delete_host_tag(opts)
+        print_error("Host #{opts[:address].to_s + " " if opts[:address]}could not be found.")
+      end
     else
       rws.each do |rw|
         rw.each do |ip|
-          opts[:ip] = ip
-          framework.db.delete_host_tag(opts)
+          opts[:address] = ip
+          unless framework.db.delete_host_tag(opts)
+            print_error("Host #{ip} could not be found.")
+          end
         end
       end
     end
@@ -554,7 +548,7 @@ class Db
             when "vulns";     host.vuln_count
             when "workspace"; host.workspace.name
             when "tags"
-              found_tags = find_host_tags(framework.db.workspace.id, host.address)
+              found_tags = find_host_tags(framework.db.workspace, host.id)
               tag_names = []
               found_tags.each { |t| tag_names << t.name }
               found_tags * ", "
@@ -983,7 +977,7 @@ class Db
 
   def cmd_notes(*args)
     return unless active?
-  ::ActiveRecord::Base.connection_pool.with_connection {
+  ::ApplicationRecord.connection_pool.with_connection {
     mode = :search
     data = nil
     types = nil
@@ -1446,7 +1440,7 @@ class Db
   #
   def cmd_db_import(*args)
     return unless active?
-  ::ActiveRecord::Base.connection_pool.with_connection {
+  ::ApplicationRecord.connection_pool.with_connection {
     if args.include?("-h") || ! (args && args.length > 0)
       cmd_db_import_help
       return
@@ -1503,15 +1497,15 @@ class Db
           print_error("Please note that there were #{warnings} warnings") if warnings > 1
           print_error("Please note that there was one warning") if warnings == 1
 
-        rescue Msf::DBImportError
+        rescue Msf::DBImportError => e
           print_error("Failed to import #{filename}: #{$!}")
-          elog("Failed to import #{filename}: #{$!.class}: #{$!}")
+          elog("Failed to import #{filename}", error: e)
           dlog("Call stack: #{$@.join("\n")}", LEV_3)
           next
         rescue REXML::ParseException => e
           print_error("Failed to import #{filename} due to malformed XML:")
           print_error("#{e.class}: #{e}")
-          elog("Failed to import #{filename}: #{e.class}: #{e}")
+          elog("Failed to import #{filename}", error: e)
           dlog("Call stack: #{$@.join("\n")}", LEV_3)
           next
         end
@@ -1531,7 +1525,7 @@ class Db
   #
   def cmd_db_export(*args)
     return unless active?
-  ::ActiveRecord::Base.connection_pool.with_connection {
+  ::ApplicationRecord.connection_pool.with_connection {
 
     export_formats = %W{xml pwdump}
     format = 'xml'
@@ -1576,7 +1570,7 @@ class Db
   #
   def cmd_db_nmap(*args)
     return unless active?
-  ::ActiveRecord::Base.connection_pool.with_connection {
+  ::ApplicationRecord.connection_pool.with_connection {
     if (args.length == 0)
       print_status("Usage: db_nmap [--save | [--help | -h]] [nmap options]")
       return
@@ -1614,27 +1608,7 @@ class Db
         arguments.push('-oX', fd.path)
       end
 
-      begin
-        nmap_pipe = ::Open3::popen3([nmap, 'nmap'], *arguments)
-        temp_nmap_threads = []
-        temp_nmap_threads << framework.threads.spawn("db_nmap-Stdout", false, nmap_pipe[1]) do |np_1|
-          np_1.each_line do |nmap_out|
-            next if nmap_out.strip.empty?
-            print_status("Nmap: #{nmap_out.strip}")
-          end
-        end
-
-        temp_nmap_threads << framework.threads.spawn("db_nmap-Stderr", false, nmap_pipe[2]) do |np_2|
-          np_2.each_line do |nmap_err|
-            next if nmap_err.strip.empty?
-            print_status("Nmap: '#{nmap_err.strip}'")
-          end
-        end
-
-        temp_nmap_threads.map {|t| t.join rescue nil}
-        nmap_pipe.each {|p| p.close rescue nil}
-      rescue ::IOError
-      end
+      run_nmap(nmap, arguments)
 
       framework.db.import_nmap_xml_file(:filename => fd.path)
 
@@ -2052,7 +2026,11 @@ class Db
   def db_connect_http(opts)
     # local database is required to use Mdm objects
     unless framework.db.active
-      print_error("No local database connected. Please connect to a local database before connecting to a remote data service.")
+      err_msg = 'No local database connected, meaning some Metasploit features will not be available. A full list of '\
+      'the affected features & database setup instructions can be found here: '\
+      'https://github.com/rapid7/metasploit-framework/wiki/msfdb:-Database-Features-&-How-to-Set-up-a-Database-for-Metasploit'
+
+      print_error(err_msg)
       return
     end
 
@@ -2132,6 +2110,38 @@ class Db
 
   #######
   private
+
+  def run_nmap(nmap, arguments, use_sudo: false)
+    print_warning('Running Nmap with sudo') if use_sudo
+    begin
+      nmap_pipe = use_sudo ? ::Open3::popen3('sudo', nmap, *arguments) : ::Open3::popen3(nmap, *arguments)
+      temp_nmap_threads = []
+      temp_nmap_threads << framework.threads.spawn("db_nmap-Stdout", false, nmap_pipe[1]) do |np_1|
+        np_1.each_line do |nmap_out|
+          next if nmap_out.strip.empty?
+          print_status("Nmap: #{nmap_out.strip}")
+        end
+      end
+
+      temp_nmap_threads << framework.threads.spawn("db_nmap-Stderr", false, nmap_pipe[2]) do |np_2|
+
+        np_2.each_line do |nmap_err|
+          next if nmap_err.strip.empty?
+          print_status("Nmap: '#{nmap_err.strip}'")
+          # Check if the stderr text includes 'root', this only happens if the scan requires root privileges
+          if nmap_err =~ /requires? root privileges/ or
+            nmap_err.include? 'only works if you are root' or nmap_err =~ /requires? raw socket access/
+            return run_nmap(nmap, arguments, use_sudo: true) unless use_sudo
+          end
+        end
+      end
+
+      temp_nmap_threads.map { |t| t.join rescue nil }
+      nmap_pipe.each { |p| p.close rescue nil }
+    rescue ::IOError
+    end
+  end
+
   #######
 
   def print_connection_info
@@ -2139,7 +2149,7 @@ class Db
     if framework.db.driver == 'http'
       cdb = framework.db.name
     else
-      ::ActiveRecord::Base.connection_pool.with_connection do |conn|
+      ::ApplicationRecord.connection_pool.with_connection do |conn|
         if conn.respond_to?(:current_database)
           cdb = conn.current_database
         end
@@ -2208,7 +2218,7 @@ class Db
   end
 
   def build_postgres_url
-    conn_params = ActiveRecord::Base.connection_config
+    conn_params = ApplicationRecord.connection_config
     url = ""
     url += "#{conn_params[:username]}" if conn_params[:username]
     url += ":#{conn_params[:password]}" if conn_params[:password]
